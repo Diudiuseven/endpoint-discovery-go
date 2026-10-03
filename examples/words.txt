@@ -1,0 +1,6 @@
+# candidate wordlist, one path per line
+admin
+login
+api
+api/v1
+robots.txt
