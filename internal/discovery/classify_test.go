@@ -17,7 +17,8 @@ func TestClassifyResponse(t *testing.T) {
 	}{
 		{"available", 200, "real content here", "", ClassAvailable},
 		{"soft404 same body", 200, "not-found!", "", ClassSoft404},
-		{"soft404 same length", 200, "xxxxxxxxx!", "", ClassSoft404},
+		{"same length different body is available", 200, "xxxxxxxxx!", "", ClassAvailable},
+		{"different status same body", 201, "not-found!", "", ClassAvailable},
 		{"not found", 404, "", "", ClassNotFound},
 		{"gone", 410, "", "", ClassNotFound},
 		{"redirect", 302, "", "/login", ClassRedirect},

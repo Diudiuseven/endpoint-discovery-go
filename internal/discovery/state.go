@@ -78,9 +78,10 @@ func (s *StateStore) apply(ev stateEvent) {
 	}
 }
 
-func (s *StateStore) record(ev stateEvent) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+// recordLocked appends ev durably, then applies it in memory. The caller
+// must hold s.mu; keeping the check-write-apply sequence under one lock
+// makes check-and-record operations race-free.
+func (s *StateStore) recordLocked(ev stateEvent) error {
 	if s.file != nil {
 		b, err := json.Marshal(ev)
 		if err != nil {
@@ -95,6 +96,12 @@ func (s *StateStore) record(ev stateEvent) error {
 	}
 	s.apply(ev)
 	return nil
+}
+
+func (s *StateStore) record(ev stateEvent) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.recordLocked(ev)
 }
 
 // Done reports whether a canonical key is confirmed complete.
@@ -122,16 +129,16 @@ func (s *StateStore) MarkDiscovered(key string) error {
 }
 
 // MarkDiscoveredIfNew atomically checks-and-records a key, reporting whether
-// it was new. This makes dynamic expansion race-free: exactly one caller
-// wins and enqueues the key.
+// it was new. The check and the durable record happen under one lock, so
+// exactly one caller wins and enqueues the key — even under concurrent
+// dynamic expansion.
 func (s *StateStore) MarkDiscoveredIfNew(key string) (bool, error) {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.discovered[key] {
-		s.mu.Unlock()
 		return false, nil
 	}
-	s.mu.Unlock()
-	if err := s.record(stateEvent{Op: "discover", Key: key}); err != nil {
+	if err := s.recordLocked(stateEvent{Op: "discover", Key: key}); err != nil {
 		return false, err
 	}
 	return true, nil
@@ -177,6 +184,28 @@ func (s *StateStore) Findings() []Finding {
 	out := make([]Finding, 0, len(s.findings))
 	for _, f := range s.findings {
 		out = append(out, f)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Path != out[j].Path {
+			return out[i].Path < out[j].Path
+		}
+		return out[i].Class < out[j].Class
+	})
+	return out
+}
+
+// ConfirmedFindings returns findings whose keys are marked done — the only
+// results a resumed run may trust. A finding that was persisted but never
+// confirmed complete (crash between "finding" and "done") is excluded; its
+// key is still pending and will be re-probed, so nothing is lost.
+func (s *StateStore) ConfirmedFindings() []Finding {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]Finding, 0, len(s.findings))
+	for k, f := range s.findings {
+		if s.done[k] {
+			out = append(out, f)
+		}
 	}
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].Path != out[j].Path {

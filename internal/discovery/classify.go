@@ -15,8 +15,9 @@ type baseline struct {
 }
 
 // matches reports whether a response is equivalent to the not-found
-// baseline: same status and identical body, or same status and identical
-// length (bodies with per-request tokens but stable size).
+// baseline: same status AND byte-identical body. Length alone is never
+// sufficient — a real page that happens to be the same size as the hint
+// page is available content and must not be merged into the baseline.
 func (b *baseline) matches(status int, body []byte) bool {
 	if b == nil || !b.set {
 		return false
@@ -24,10 +25,7 @@ func (b *baseline) matches(status int, body []byte) bool {
 	if status != b.status {
 		return false
 	}
-	if sha256.Sum256(body) == b.hash {
-		return true
-	}
-	return int64(len(body)) == b.length && b.length >= 0
+	return sha256.Sum256(body) == b.hash
 }
 
 // isRedirectStatus reports whether status is an HTTP redirect.

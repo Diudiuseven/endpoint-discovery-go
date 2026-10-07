@@ -164,10 +164,14 @@ func (e *Engine) Run(ctx context.Context) (res *Result, err error) {
 	}()
 	bl := e.probeBaseline(ctx)
 
-	// Preload findings persisted by previous interrupted runs so the final
-	// result is complete (no omissions) and deduped by canonical key.
+	// Preload findings confirmed complete by previous interrupted runs so
+	// the final result is complete (no omissions) and deduped by canonical
+	// key. Findings persisted but never marked done are NOT preloaded:
+	// their keys are still pending, get re-probed below, and the fresh
+	// result is the one recorded — an unconfirmed path is never treated
+	// as finished.
 	seen := map[string]bool{}
-	for _, f := range e.state.Findings() {
+	for _, f := range e.state.ConfirmedFindings() {
 		seen[f.URL] = true
 		e.findings = append(e.findings, f)
 	}
@@ -266,7 +270,11 @@ func (e *Engine) seed(enqueue func(task), words []string, depth int) {
 	}
 }
 
-// joinPath resolves a candidate word against the target base.
+// joinPath resolves a candidate word against the target base. Path identity
+// is query- and fragment-independent, so any "?"/"#" suffix in a relative
+// word is dropped BEFORE composing the URL — otherwise url.URL would escape
+// it into the path (%3F) and each query spelling would become a distinct
+// target that gets requested separately.
 func joinPath(base *url.URL, word string) string {
 	w := strings.TrimSpace(word)
 	if w == "" {
@@ -274,6 +282,12 @@ func joinPath(base *url.URL, word string) string {
 	}
 	if strings.Contains(w, "://") {
 		return w // absolute URL candidate; scope check decides
+	}
+	if i := strings.IndexAny(w, "?#"); i >= 0 {
+		w = w[:i]
+	}
+	if w == "" {
+		return base.String()
 	}
 	if strings.HasPrefix(w, "/") {
 		b := *base
@@ -312,7 +326,11 @@ func (e *Engine) process(ctx context.Context, t task, bl *baseline, enqueue func
 	}
 	f.Depth = t.depth
 	if err := e.state.RecordFinding(t.key, f); err != nil {
+		// The result could not be persisted: do NOT mark the key done,
+		// or a resume would skip it and the finding would be lost. The
+		// key stays pending and is re-probed on the next run.
 		e.logger.Printf("WARN state: %v", err)
+		return
 	}
 	e.mu.Lock()
 	if !e.seenFindings[f.URL] {
@@ -450,7 +468,10 @@ func (e *Engine) doOnce(ctx context.Context, rawurl string) (status int, body []
 	return resp.StatusCode, body, location, retryable, nil
 }
 
-// probeBaseline learns the not-found signature of the target.
+// probeBaseline learns the not-found signature of the target. Redirect
+// chains are followed exactly like for regular probes: a target that
+// redirects unknown paths to a hint page must yield the hint page's
+// signature, not the redirect's.
 func (e *Engine) probeBaseline(ctx context.Context) *baseline {
 	bl := &baseline{}
 	u := *e.target
@@ -462,15 +483,26 @@ func (e *Engine) probeBaseline(ctx context.Context) *baseline {
 	if !e.scope.Allow(&u) {
 		return bl // baseline path out of configured scope; skip detection
 	}
-	status, body, _, err := e.doWithRetries(ctx, u.String())
-	if err != nil {
+	current := u.String()
+	for hops := 0; ; hops++ {
+		status, body, location, err := e.doWithRetries(ctx, current)
+		if err != nil {
+			return bl
+		}
+		if isRedirectStatus(status) && location != "" && hops < e.cfg.MaxRedirects {
+			next, rerr := NormalizeURL(resolveRef(current, location))
+			if rerr != nil || !e.scope.Allow(next) {
+				return bl // chain leaves scope: no trustworthy signature
+			}
+			current = next.String()
+			continue
+		}
+		bl.status = status
+		bl.length = int64(len(body))
+		bl.hash = sha256Sum(body)
+		bl.set = true
 		return bl
 	}
-	bl.status = status
-	bl.length = int64(len(body))
-	bl.hash = sha256Sum(body)
-	bl.set = true
-	return bl
 }
 
 func sha256Sum(b []byte) [32]byte { return sha256.Sum256(b) }

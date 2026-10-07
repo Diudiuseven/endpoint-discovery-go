@@ -40,7 +40,9 @@ func NormalizeURL(raw string) (*url.URL, error) {
 	}
 	u.Host = net.JoinHostPort(host, port)
 	u.Path = CanonicalPath(u.Path)
+	u.RawPath = "" // stale escapes must not survive re-canonicalization
 	u.RawQuery = ""
+	u.ForceQuery = false
 	u.Fragment = ""
 	u.User = nil
 	return u, nil
