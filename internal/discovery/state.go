@@ -81,6 +81,13 @@ func (s *StateStore) apply(ev stateEvent) {
 func (s *StateStore) record(ev stateEvent) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.recordLocked(ev)
+}
+
+// recordLocked appends and applies an event while the caller holds s.mu.
+// Holding the lock across the write makes check-and-record sequences
+// atomic: a second goroutine can never observe the pre-record state.
+func (s *StateStore) recordLocked(ev stateEvent) error {
 	if s.file != nil {
 		b, err := json.Marshal(ev)
 		if err != nil {
@@ -122,16 +129,17 @@ func (s *StateStore) MarkDiscovered(key string) error {
 }
 
 // MarkDiscoveredIfNew atomically checks-and-records a key, reporting whether
-// it was new. This makes dynamic expansion race-free: exactly one caller
-// wins and enqueues the key.
+// it was new. The check, durable write and in-memory update happen under a
+// single lock, so concurrent callers can never both win: exactly one caller
+// enqueues the key. This keeps dynamic expansion and seeding race-free even
+// with thousands of candidates.
 func (s *StateStore) MarkDiscoveredIfNew(key string) (bool, error) {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.discovered[key] {
-		s.mu.Unlock()
 		return false, nil
 	}
-	s.mu.Unlock()
-	if err := s.record(stateEvent{Op: "discover", Key: key}); err != nil {
+	if err := s.recordLocked(stateEvent{Op: "discover", Key: key}); err != nil {
 		return false, err
 	}
 	return true, nil

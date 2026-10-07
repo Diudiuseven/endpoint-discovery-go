@@ -1,6 +1,7 @@
 package discovery
 
 import (
+	"bytes"
 	"testing"
 	"time"
 )
@@ -17,7 +18,10 @@ func TestClassifyResponse(t *testing.T) {
 	}{
 		{"available", 200, "real content here", "", ClassAvailable},
 		{"soft404 same body", 200, "not-found!", "", ClassSoft404},
-		{"soft404 same length", 200, "xxxxxxxxx!", "", ClassSoft404},
+		// Same LENGTH as the hint page but different bytes: a real page must
+		// never be merged into soft_404 just because of equal size.
+		{"available same length different body", 200, "xxxxxxxxx!", "", ClassAvailable},
+		{"available one byte off", 200, "not-found?", "", ClassAvailable},
 		{"not found", 404, "", "", ClassNotFound},
 		{"gone", 410, "", "", ClassNotFound},
 		{"redirect", 302, "", "/login", ClassRedirect},
@@ -34,6 +38,36 @@ func TestClassifyResponse(t *testing.T) {
 				t.Fatalf("got %s want %s", got, c.want)
 			}
 		})
+	}
+}
+
+// TestBaselineMatchesExactBody pins the soft-404 equivalence semantics: a
+// response is equivalent to the hint page only when status AND every body
+// byte match. Equal length alone, or an unset baseline, never matches.
+func TestBaselineMatchesExactBody(t *testing.T) {
+	hint := []byte("<html>404 page not found here</html>")
+	bl := &baseline{status: 200, length: int64(len(hint)), set: true}
+	bl.hash = sha256Sum(hint)
+
+	if !bl.matches(200, hint) {
+		t.Error("byte-identical body must match the soft-404 baseline")
+	}
+	// Deterministically build a real page of the EXACT same length as the
+	// hint page but with different bytes.
+	sameSize := bytes.Repeat([]byte("R"), len(hint))
+	if bl.matches(200, sameSize) {
+		t.Error("equal-length but different body must NOT match soft-404 baseline")
+	}
+	// Different status never matches even with identical body.
+	if bl.matches(404, hint) {
+		t.Error("different status must not match")
+	}
+	// Unset baseline never matches.
+	if (&baseline{}).matches(200, hint) {
+		t.Error("unset baseline must not match")
+	}
+	if (*baseline)(nil).matches(200, hint) {
+		t.Error("nil baseline must not match")
 	}
 }
 

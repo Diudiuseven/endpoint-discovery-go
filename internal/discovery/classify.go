@@ -15,8 +15,11 @@ type baseline struct {
 }
 
 // matches reports whether a response is equivalent to the not-found
-// baseline: same status and identical body, or same status and identical
-// length (bodies with per-request tokens but stable size).
+// baseline. Equivalence is strict: the status must be the same AND every
+// body byte must be identical. Equal length with different content is
+// deliberately NOT equivalent, because real sites commonly serve genuine
+// pages whose size happens to equal the fixed-size hint page; matching on
+// size alone would wrongly hide them as soft 404s.
 func (b *baseline) matches(status int, body []byte) bool {
 	if b == nil || !b.set {
 		return false
@@ -24,10 +27,12 @@ func (b *baseline) matches(status int, body []byte) bool {
 	if status != b.status {
 		return false
 	}
-	if sha256.Sum256(body) == b.hash {
-		return true
+	// Cheap exactness guard: different length necessarily means different
+	// bytes; only same-length bodies are worth hashing.
+	if int64(len(body)) != b.length {
+		return false
 	}
-	return int64(len(body)) == b.length && b.length >= 0
+	return sha256.Sum256(body) == b.hash
 }
 
 // isRedirectStatus reports whether status is an HTTP redirect.

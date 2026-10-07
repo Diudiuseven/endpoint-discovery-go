@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -24,14 +25,15 @@ const maxBodyBytes = 4 << 20
 
 // Engine orchestrates a scan.
 type Engine struct {
-	cfg      Config
-	scope    *Scope
-	target   *url.URL
-	client   *http.Client
-	limiter  *Limiter
-	state    *StateStore
-	logger   *log.Logger
-	inflight sync.Map
+	cfg       Config
+	scope     *Scope
+	target    *url.URL
+	client    *http.Client
+	transport http.RoundTripper
+	limiter   *Limiter
+	state     *StateStore
+	logger    *log.Logger
+	inflight  sync.Map
 
 	mu           sync.Mutex
 	findings     []Finding
@@ -93,16 +95,38 @@ func NewEngine(cfg Config) (*Engine, error) {
 	if err != nil {
 		return nil, err
 	}
+	// A dedicated Transport per engine: scans (including resumed runs in the
+	// same process) never share a keep-alive pool, so a connection whose
+	// response was abandoned by a cancelled scan cannot be reused by a
+	// later run and poison its retries.
+	transport := &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
 	client := &http.Client{
 		Timeout: cfg.Timeout,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			return http.ErrUseLastResponse // manual chain handling
 		},
+		Transport: transport,
 	}
 	return &Engine{
-		cfg: cfg, scope: scope, target: target, client: client,
-		limiter: NewLimiter(cfg.RequestsPerSecond, cfg.Concurrency),
-		state:   state, logger: cfg.Logger,
+		cfg:       cfg,
+		scope:     scope,
+		target:    target,
+		client:    client,
+		transport: transport,
+		limiter:   NewLimiter(cfg.RequestsPerSecond, cfg.Concurrency),
+		state:     state,
+		logger:    cfg.Logger,
 	}, nil
 }
 
@@ -161,6 +185,9 @@ func (e *Engine) Run(ctx context.Context) (res *Result, err error) {
 		if cerr := e.state.Close(); cerr != nil && err == nil {
 			err = cerr
 		}
+		if tr, ok := e.transport.(*http.Transport); ok {
+			tr.CloseIdleConnections()
+		}
 	}()
 	bl := e.probeBaseline(ctx)
 
@@ -181,15 +208,28 @@ func (e *Engine) Run(ctx context.Context) (res *Result, err error) {
 	}
 
 	// Seed: wordlist plus anything discovered-but-unfinished from a
-	// previous interrupted run. Pending is captured BEFORE seeding so
-	// wordlist keys are not enqueued twice.
+	// previous interrupted run. Pending is captured BEFORE seeding; a pending
+	// key that the wordlist also covers is owned by the seed and must not be
+	// enqueued a second time, so no duplicate task (or request) is possible.
 	pending := e.state.Pending()
-	e.seed(enqueue, e.cfg.Wordlist, 0)
+	seeded := map[string]bool{}
+	e.seed(func(t task) {
+		seeded[t.key] = true
+		enqueue(t)
+	}, e.cfg.Wordlist, 0)
 	for _, key := range pending {
+		if seeded[key] {
+			continue // wordlist seed already enqueued it
+		}
 		u, perr := url.Parse(key)
 		if perr != nil || !e.scope.Allow(u) {
 			continue
 		}
+		if e.state.Done(key) {
+			e.resumed.Add(1)
+			continue
+		}
+		e.submitted.Add(1)
 		enqueue(task{key: key, url: key, depth: 0})
 	}
 
@@ -266,11 +306,21 @@ func (e *Engine) seed(enqueue func(task), words []string, depth int) {
 	}
 }
 
-// joinPath resolves a candidate word against the target base.
+// joinPath resolves a candidate word against the target base. Query
+// strings and fragments in the candidate are always dropped: identity is
+// defined solely by the normalized path, so "p?a=1" and "p?b=2" collapse
+// to one target and are requested exactly once.
 func joinPath(base *url.URL, word string) string {
 	w := strings.TrimSpace(word)
 	if w == "" {
 		return base.String()
+	}
+	// Cut query/fragment off the raw word BEFORE it can be interpreted as
+	// part of a URL struct: assigning "p?x=1" to url.URL.Path and calling
+	// String() would percent-escape the '?' into %3F, smuggling the query
+	// past normalization.
+	if i := strings.IndexAny(w, "?#"); i >= 0 {
+		w = w[:i]
 	}
 	if strings.Contains(w, "://") {
 		return w // absolute URL candidate; scope check decides
@@ -346,44 +396,79 @@ func (e *Engine) process(ctx context.Context, t task, bl *baseline, enqueue func
 // handling, then classifies the outcome.
 func (e *Engine) probeWithBaseline(ctx context.Context, u *url.URL, bl *baseline) Finding {
 	f := Finding{Path: CanonicalPath(u.Path), URL: u.String(), Class: ClassError}
-	current := u.String()
-	var lastLocation string
+	final, chainOK := e.fetchChain(ctx, u, func(status int) bool {
+		return isRedirectStatus(status)
+	})
+	if final.err != nil {
+		f.Class = ClassError
+		return f
+	}
+	f.StatusCode = final.status
+	f.ContentLength = int64(len(final.body))
+	f.Class = classifyResponse(final.status, final.body, final.location, bl)
+	if !chainOK {
+		// Chain left scope or hit the hop cap: the last response itself is
+		// the verdict (ClassRedirect); record where it pointed.
+		f.Class = ClassRedirect
+		f.RedirectTo = final.location
+		return f
+	}
+	if final.throughRedirect {
+		// Chain was followed to a final non-redirect response; a chain that
+		// ends on a hint page / hard 404 is classified from that final
+		// response, identical to visiting it directly.
+		f.RedirectTo = final.finalURL
+	}
+	if f.Class == ClassRedirect && final.location != "" {
+		f.RedirectTo = final.location
+	}
+	f.body = final.body
+	return f
+}
+
+// chainResult is the terminal response of a redirect-chain walk.
+type chainResult struct {
+	status          int
+	body            []byte
+	location        string // Location header of the terminal response
+	finalURL        string // URL of the terminal response
+	throughRedirect bool   // at least one hop was followed
+	err             error
+}
+
+// fetchChain performs manual redirect following (the HTTP client is
+// configured with ErrUseLastResponse). Every hop passes through retries,
+// the rate limiter and scope checks. The returned bool is false when the
+// chain could not be followed to a final non-redirect response (out-of-scope
+// hop or hop cap reached); in that case chainResult holds the last
+// response, which the caller reports as ClassRedirect.
+func (e *Engine) fetchChain(ctx context.Context, start *url.URL, isRedirect func(int) bool) (chainResult, bool) {
+	current := start.String()
 	for hops := 0; ; hops++ {
 		status, body, location, err := e.doWithRetries(ctx, current)
 		if err != nil {
-			f.Class = ClassError
-			return f
+			return chainResult{err: err, finalURL: current}, true
 		}
-		if isRedirectStatus(status) && location != "" && hops < e.cfg.MaxRedirects {
+		if isRedirect(status) && location != "" && hops < e.cfg.MaxRedirects {
 			next, rerr := NormalizeURL(resolveRef(current, location))
 			if rerr != nil || !e.scope.Allow(next) {
-				// Do not follow out of scope; report the redirect itself.
-				f.Class = ClassRedirect
-				f.StatusCode = status
-				f.ContentLength = int64(len(body))
-				f.RedirectTo = location
-				return f
+				return chainResult{
+					status:   status,
+					body:     body,
+					location: location,
+					finalURL: current,
+				}, false
 			}
-			lastLocation = next.String()
 			current = next.String()
 			continue
 		}
-		f.StatusCode = status
-		f.ContentLength = int64(len(body))
-		f.Class = classifyResponse(status, body, location, bl)
-		if lastLocation != "" && f.Class != ClassRedirect {
-			// Chain was followed to a final non-redirect response.
-			f.RedirectTo = lastLocation
-		}
-		if f.Class == ClassRedirect {
-			if location != "" {
-				f.RedirectTo = location
-			} else {
-				f.RedirectTo = lastLocation
-			}
-		}
-		f.body = body
-		return f
+		return chainResult{
+			status:          status,
+			body:            body,
+			location:        location,
+			finalURL:        current,
+			throughRedirect: hops > 0,
+		}, true
 	}
 }
 
@@ -450,7 +535,12 @@ func (e *Engine) doOnce(ctx context.Context, rawurl string) (status int, body []
 	return resp.StatusCode, body, location, retryable, nil
 }
 
-// probeBaseline learns the not-found signature of the target.
+// probeBaseline learns the not-found signature of the target. The fixed
+// improbable path is fetched through the SAME redirect-chain logic as real
+// probes, so targets that answer unknown paths with a redirect to a fixed
+// hint page are learned correctly: the signature is the terminal response
+// (status + exact body), and a chain landing on it is judged identically to
+// a direct request.
 func (e *Engine) probeBaseline(ctx context.Context) *baseline {
 	bl := &baseline{}
 	u := *e.target
@@ -462,13 +552,13 @@ func (e *Engine) probeBaseline(ctx context.Context) *baseline {
 	if !e.scope.Allow(&u) {
 		return bl // baseline path out of configured scope; skip detection
 	}
-	status, body, _, err := e.doWithRetries(ctx, u.String())
-	if err != nil {
+	final, ok := e.fetchChain(ctx, &u, isRedirectStatus)
+	if final.err != nil || !ok {
 		return bl
 	}
-	bl.status = status
-	bl.length = int64(len(body))
-	bl.hash = sha256Sum(body)
+	bl.status = final.status
+	bl.length = int64(len(final.body))
+	bl.hash = sha256Sum(final.body)
 	bl.set = true
 	return bl
 }
